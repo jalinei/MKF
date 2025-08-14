@@ -3,6 +3,12 @@
 #include <MAS.hpp>
 #include "processors/Inputs.h"
 #include "constructive_models/Magnetic.h"
+#include "json.hpp"
+#include "Definitions.h"
+#include <vector>
+#include <string>
+#include <optional>
+#include <complex>
 
 using namespace MAS;
 
@@ -170,3 +176,61 @@ inline void to_json(json & j, const AdvancedFlyback & x) {
     j["currentRippleRatio"] = x.get_current_ripple_ratio();
 }
 } // namespace OpenMagnetics
+
+namespace OpenMagnetics {
+struct GridParams {
+    double VLL_rms;
+    double f_hz;
+    double Rgrid_ohm;
+    double Lgrid_h;
+};
+
+struct L1Params {
+    double R1_ohm = 0.0;
+    double L1_h = 0.0;
+};
+
+class TwoLevelInverter {
+public:
+    struct Load {
+        std::string type;
+        double phaseVoltage = 0.0;
+        double gridFrequency = 0.0;
+        double gridResistance = 0.0;
+        double gridInductance = 0.0;
+        double resistance = 0.0;
+        double inductance = 0.0;
+    };
+    struct OperatingPoint {
+        double fundamentalFrequency = 0.0;
+        std::optional<double> powerFactor;
+        std::optional<double> currentPhaseAngle;
+        std::optional<double> outputPower;
+        Load load;
+    };
+
+private:
+    double dcBusVoltage = 0.0;
+    double vdcRipple = 0.0;
+    double inverterLegPowerRating = 0.0;
+    double lineRmsCurrent = 0.0;
+    double switchingFrequency = 0.0;
+    double riseTime = 0.0;
+    double deadtime = 0.0;
+    std::string pwmType;
+    std::string modulationStrategy;
+    double thirdHarmonicInjectionCoefficient = 0.0;
+    double modulationDepth = 0.0;
+    std::vector<OperatingPoint> operatingPoints;
+
+public:
+    TwoLevelInverter() = default;
+    TwoLevelInverter(const nlohmann::json& j);
+
+    double compute_current_ripple(const L1Params& l1,
+                                  size_t opIndex,
+                                  int fund_cycles = 1,
+                                  int samples_per_carrier = 20,
+                                  double f_cut = 1000.0) const;
+};
+}
