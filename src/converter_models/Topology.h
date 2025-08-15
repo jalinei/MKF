@@ -178,59 +178,89 @@ inline void to_json(json & j, const AdvancedFlyback & x) {
 } // namespace OpenMagnetics
 
 namespace OpenMagnetics {
+// Simple description of the external grid seen by the converter
+// VLL_rms: line-to-line RMS voltage of the grid
+// f_hz:    fundamental frequency in Hertz
+// Rgrid_ohm / Lgrid_h: series impedance modelling the grid
 struct GridParams {
-    double VLL_rms;
-    double f_hz;
-    double Rgrid_ohm;
-    double Lgrid_h;
+    double VLL_rms;    // [V] line-to-line RMS voltage
+    double f_hz;       // [Hz] fundamental frequency
+    double Rgrid_ohm;  // [Ohm] grid resistance
+    double Lgrid_h;    // [H] grid inductance
 };
 
+// Parameters of the first inductor of an L or LCL output filter
+// Only the resistance and inductance are required for the ripple
+// estimation carried out by the TwoLevelInverter class
 struct L1Params {
-    double R1_ohm = 0.0;
-    double L1_h = 0.0;
+    double R1_ohm = 0.0; // [Ohm] series resistance
+    double L1_h = 0.0;   // [H] inductance value
 };
 
+//------------------------------------------------------------------------------
+// TwoLevelInverter
+//------------------------------------------------------------------------------
+// Convenience C++ port of the reference Python script supplied by the user.
+// The class stores all the information needed to reproduce the switching
+// waveform of a single inverter leg and to estimate the high–frequency ripple
+// of the series inductor current.  Only the parameters requested in the JSON
+// schema are stored so that the class mirrors the user's input structure.
 class TwoLevelInverter {
 public:
+    // Description of the electrical load connected to the inverter.  Depending
+    // on the "type" field the relevant members are used:
+    //  - "grid": phaseVoltage, gridFrequency, gridResistance, gridInductance
+    //  - "R-L":  resistance, inductance
     struct Load {
-        std::string type;
-        double phaseVoltage = 0.0;
-        double gridFrequency = 0.0;
-        double gridResistance = 0.0;
-        double gridInductance = 0.0;
-        double resistance = 0.0;
-        double inductance = 0.0;
+        std::string type;      // "grid" or "R-L"
+        double phaseVoltage = 0.0;   // [V] phase RMS voltage when grid connected
+        double gridFrequency = 0.0;  // [Hz] grid fundamental frequency
+        double gridResistance = 0.0; // [Ohm] equivalent grid resistance
+        double gridInductance = 0.0; // [H] equivalent grid inductance
+        double resistance = 0.0;     // [Ohm] load resistance for R‑L loads
+        double inductance = 0.0;     // [H] load inductance for R‑L loads
     };
+
+    // Electrical operating point for which ripple will be calculated.
+    // The power factor may be specified either directly or via the current
+    // phase angle.  When connected to a grid the output power is required.
     struct OperatingPoint {
-        double fundamentalFrequency = 0.0;
-        std::optional<double> powerFactor;
-        std::optional<double> currentPhaseAngle;
-        std::optional<double> outputPower;
-        Load load;
+        double fundamentalFrequency = 0.0;      // [Hz]
+        std::optional<double> powerFactor;      // cos(phi)
+        std::optional<double> currentPhaseAngle; // [deg]
+        std::optional<double> outputPower;      // [W]
+        Load load;                              // Load description
     };
 
 private:
-    double dcBusVoltage = 0.0;
-    double vdcRipple = 0.0;
-    double inverterLegPowerRating = 0.0;
-    double lineRmsCurrent = 0.0;
-    double switchingFrequency = 0.0;
-    double riseTime = 0.0;
-    double deadtime = 0.0;
-    std::string pwmType;
-    std::string modulationStrategy;
+    // Basic inverter configuration parameters taken from the JSON input
+    double dcBusVoltage = 0.0;                  // [V]
+    double vdcRipple = 0.0;                     // [V] DC bus ripple (unused)
+    double inverterLegPowerRating = 0.0;        // [W]
+    double lineRmsCurrent = 0.0;                // [A]
+    double switchingFrequency = 0.0;            // [Hz]
+    double riseTime = 0.0;                      // [s] transistor rise time
+    double deadtime = 0.0;                      // [s]
+    std::string pwmType;                        // carrier waveform type
+    std::string modulationStrategy;             // SPWM or SVPWM
     double thirdHarmonicInjectionCoefficient = 0.0;
-    double modulationDepth = 0.0;
-    std::vector<OperatingPoint> operatingPoints;
+    double modulationDepth = 0.0;               // modulation index
+    std::vector<OperatingPoint> operatingPoints; // list of operating points
 
 public:
     TwoLevelInverter() = default;
-    TwoLevelInverter(const nlohmann::json& j);
+    explicit TwoLevelInverter(const nlohmann::json& j);
 
+    // Estimate high‑frequency ripple current of the first filter inductor.
+    //  l1               – series inductor parameters
+    //  opIndex          – index into the operatingPoints vector
+    //  fund_cycles      – number of fundamental cycles to simulate
+    //  samples_per_carrier – time resolution of the carrier waveform
+    //  f_cut            – frequency above which RMS ripple is accumulated
     double compute_current_ripple(const L1Params& l1,
                                   size_t opIndex,
                                   int fund_cycles = 1,
                                   int samples_per_carrier = 20,
                                   double f_cut = 1000.0) const;
 };
-}
+} // namespace OpenMagnetics
