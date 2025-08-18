@@ -2,6 +2,9 @@
 #include "physical_models/MagnetizingInductance.h"
 #include "support/Utils.h"
 #include <cfloat>
+#include <cmath>
+#include <algorithm>
+#include <complex>
 
 namespace OpenMagnetics {
 
@@ -648,5 +651,317 @@ namespace OpenMagnetics {
 
         return inputs;
     }
+
+} // namespace OpenMagnetics
+namespace OpenMagnetics {
+
+using json = nlohmann::json;
+
+struct LegReference { double Vg_phase_rms; double I_leg_rms; double I_leg_angle_deg; double P_leg_w; double Q_leg_var; std::complex<double> Zg_ohm; std::complex<double> V_pcc_ref; std::complex<double> V_inv_ref; double V_pcc_rms; double V_pcc_angle_deg; double V_inv_rms; double V_inv_angle_deg; };
+
+static std::vector<int> delay_rising_edges(const std::vector<int>& bit, int Ndt) {
+    if (Ndt <= 0) return bit;
+    std::vector<int> out(bit);
+    for (size_t i = 1; i < bit.size(); ++i) {
+        if (bit[i] == 1 && bit[i-1] == 0) {
+            size_t k2 = std::min(static_cast<size_t>(i + Ndt), out.size());
+            for (size_t k = i; k < k2; ++k) out[k] = 0;
+        }
+    }
+    return out;
+}
+
+static void apply_deadtime_to_complementary(const std::vector<int>& s_top,
+                                            double t_dead_s,
+                                            double fs,
+                                            std::vector<int>& g_top,
+                                            std::vector<int>& g_bot,
+                                            int& Ndt) {
+    Ndt = static_cast<int>(std::round(t_dead_s * fs));
+    g_top = delay_rising_edges(s_top, Ndt);
+    std::vector<int> s_bot_ideal(s_top.size());
+    for (size_t i = 0; i < s_top.size(); ++i) s_bot_ideal[i] = 1 - s_top[i];
+    g_bot = delay_rising_edges(s_bot_ideal, Ndt);
+    for (size_t i = 0; i < g_top.size(); ++i) {
+        if (g_top[i] == 1 && g_bot[i] == 1) {
+            g_top[i] = 0; g_bot[i] = 0;
+        }
+    }
+}
+
+static std::vector<double> pole_voltage_with_deadtime(const std::vector<int>& g_top,
+                                                      const std::vector<int>& g_bot,
+                                                      double Vdc,
+                                                      const std::vector<double>& i_leg_inst) {
+    std::vector<double> v(i_leg_inst.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        bool pos = g_top[i] == 1;
+        bool neg = g_bot[i] == 1;
+        bool off = !(pos || neg);
+        if (pos) v[i] = +0.5 * Vdc;
+        else if (neg) v[i] = -0.5 * Vdc;
+        else if (off && i_leg_inst[i] >= 0) v[i] = -0.5 * Vdc;
+        else v[i] = +0.5 * Vdc;
+    }
+    return v;
+}
+
+// Generate the instantaneous phase current for a given RMS value and angle.
+// Only the fundamental component is considered; harmonics are ignored.
+static std::vector<double> fundamental_leg_current_wave(double I_leg_rms,
+                                                        double I_leg_angle_deg,
+                                                        double f1,
+                                                        const std::vector<double>& t) {
+    std::vector<double> i(t.size());
+    double Ipk = std::sqrt(2.0) * I_leg_rms;     // convert RMS to peak
+    double angle = I_leg_angle_deg * M_PI / 180.0;
+    for (size_t k = 0; k < t.size(); ++k) {
+        i[k] = Ipk * std::sin(2.0 * M_PI * f1 * t[k] + angle);
+    }
+    return i;
+}
+
+// Resolve steady–state phasors for a single inverter leg at the PCC.  The
+// equations follow the same approach as the Python reference: given the grid
+// parameters and a desired output power/phase, determine the required inverter
+// pole voltage and current.
+static LegReference compute_leg_reference(double P_leg_w,
+                                          double PF,
+                                          bool lagging,
+                                          const GridParams& grid,
+                                          const L1Params& l1) {
+    LegReference res;
+    double V_phase_rms = grid.VLL_rms / std::sqrt(3.0);      // phase RMS voltage
+    double omega = 2.0 * M_PI * grid.f_hz;
+    std::complex<double> Zg(grid.Rgrid_ohm, omega * grid.Lgrid_h);
+    double I_leg_rms = P_leg_w / (V_phase_rms * PF);
+    double phi = std::acos(PF);
+    double I_angle = lagging ? -phi : +phi;
+    std::complex<double> I_ph = std::polar(I_leg_rms, I_angle);
+    double Q_leg = V_phase_rms * I_leg_rms * std::sin(phi);
+    if (!lagging) Q_leg = -Q_leg;
+    std::complex<double> Vg_ph(V_phase_rms, 0);
+    std::complex<double> V_pcc = Vg_ph - I_ph * Zg;          // point of common coupling
+    std::complex<double> Z1(l1.R1_ohm, omega * l1.L1_h);
+    std::complex<double> V_inv = V_pcc + I_ph * Z1;          // inverter pole voltage
+
+    res.Vg_phase_rms = V_phase_rms;
+    res.I_leg_rms = I_leg_rms;
+    res.I_leg_angle_deg = I_angle * 180.0 / M_PI;
+    res.P_leg_w = P_leg_w;
+    res.Q_leg_var = Q_leg;
+    res.Zg_ohm = Zg;
+    res.V_pcc_ref = V_pcc;
+    res.V_inv_ref = V_inv;
+    res.V_pcc_rms = std::abs(V_pcc);
+    res.V_pcc_angle_deg = std::arg(V_pcc) * 180.0 / M_PI;
+    res.V_inv_rms = std::abs(V_inv);
+    res.V_inv_angle_deg = std::arg(V_inv) * 180.0 / M_PI;
+    return res;
+}
+
+// Generate a symmetric triangular carrier waveform with values in [-1, 1].
+static std::vector<double> tri_wave(const std::vector<double>& t, double f_carrier) {
+    std::vector<double> tri(t.size());
+    for (size_t i = 0; i < t.size(); ++i) {
+        double x = std::fmod(t[i] * f_carrier, 1.0);
+        tri[i] = 4.0 * std::abs(x - 0.5) - 1.0; // triangle with unit amplitude
+    }
+    return tri;
+}
+
+// Create three phase voltage references with optional third harmonic injection.
+static void three_phase_references(double V_phase_rms,
+                                   double f1,
+                                   double phase_deg,
+                                   const std::vector<double>& t,
+                                   double third_harm_coeff,
+                                   std::vector<double>& va,
+                                   std::vector<double>& vb,
+                                   std::vector<double>& vc) {
+    double A = std::sqrt(2.0) * V_phase_rms; // peak phase voltage
+    double w1 = 2.0 * M_PI * f1;
+    double phase = phase_deg * M_PI / 180.0;
+    va.resize(t.size()); vb.resize(t.size()); vc.resize(t.size());
+    for (size_t i = 0; i < t.size(); ++i) {
+        double th = w1 * t[i] + phase;
+        double baseA = std::sin(th);
+        double baseB = std::sin(th - 2.0 * M_PI / 3.0);
+        double baseC = std::sin(th + 2.0 * M_PI / 3.0);
+        double v3 = (third_harm_coeff != 0.0) ? std::sin(3.0 * th) * third_harm_coeff : 0.0;
+        va[i] = A * (baseA + v3);
+        vb[i] = A * (baseB + v3);
+        vc[i] = A * (baseC + v3);
+    }
+}
+
+// Apply the space–vector PWM zero-sequence component so the references make
+// full use of the available DC bus without entering overmodulation.
+static void svpwm_zero_sequence(std::vector<double>& va,
+                                std::vector<double>& vb,
+                                std::vector<double>& vc) {
+    for (size_t i = 0; i < va.size(); ++i) {
+        double vmax = std::max({va[i], vb[i], vc[i]});
+        double vmin = std::min({va[i], vb[i], vc[i]});
+        double e0 = -0.5 * (vmax + vmin);
+        va[i] += e0; vb[i] += e0; vc[i] += e0;
+    }
+}
+
+// Compare the normalised reference against the carrier to obtain the ideal
+// top-device gating signal (0 or 1).
+static std::vector<int> carrier_compare(const std::vector<double>& v_norm,
+                                        const std::vector<double>& tri) {
+    std::vector<int> s(v_norm.size());
+    for (size_t i = 0; i < v_norm.size(); ++i) {
+        double v = std::clamp(v_norm[i], -1.0, 1.0);
+        s[i] = (v >= tri[i]) ? 1 : 0;
+    }
+    return s;
+}
+
+// Compute an RMS spectrum (magnitude of each FFT bin) for a real signal.
+static std::pair<std::vector<double>, std::vector<double>> rms_spectrum(const std::vector<double>& x, double fs) {
+    size_t N = x.size();
+    size_t K = N / 2 + 1;
+    std::vector<std::complex<double>> X(K, {0.0, 0.0});
+    for (size_t k = 0; k < K; ++k) {
+        std::complex<double> sum(0.0, 0.0);
+        for (size_t n = 0; n < N; ++n) {
+            double ang = -2.0 * M_PI * k * n / static_cast<double>(N);
+            sum += std::complex<double>(x[n] * std::cos(ang), x[n] * std::sin(ang));
+        }
+        X[k] = sum / static_cast<double>(N);
+    }
+    std::vector<double> mag(K), Vrms(K, 0.0), freqs(K);
+    for (size_t k = 0; k < K; ++k) {
+        mag[k] = std::abs(X[k]);
+        freqs[k] = k * fs / static_cast<double>(N);
+    }
+    Vrms[0] = mag[0];
+    if (N % 2 == 0) {
+        for (size_t k = 1; k < K - 1; ++k) Vrms[k] = (2.0 * mag[k]) / std::sqrt(2.0);
+        Vrms[K - 1] = mag[K - 1] / std::sqrt(2.0);
+    } else {
+        for (size_t k = 1; k < K; ++k) Vrms[k] = (2.0 * mag[k]) / std::sqrt(2.0);
+    }
+    return {freqs, Vrms};
+}
+
+// Magnitude of the series impedance (filter inductor + grid) for each frequency
+// bin.  Used to convert pole-voltage harmonics into inductor current harmonics.
+static std::vector<double> denom_mag(const std::vector<double>& freqs,
+                                     const L1Params& l1,
+                                     const GridParams& grid) {
+    std::vector<double> denom(freqs.size());
+    for (size_t i = 0; i < freqs.size(); ++i) {
+        double w = 2.0 * M_PI * freqs[i];
+        std::complex<double> Z1(l1.R1_ohm, w * l1.L1_h);
+        std::complex<double> Zg(grid.Rgrid_ohm, w * grid.Lgrid_h);
+        denom[i] = std::abs(Z1 + Zg);
+    }
+    return denom;
+}
+
+TwoLevelInverter::TwoLevelInverter(const json& j) {
+    dcBusVoltage = resolve_dimensional_values(j.at("dcBusVoltage"));
+    vdcRipple = resolve_dimensional_values(j.at("vdcRipple"));
+    inverterLegPowerRating = j.at("inverterLegPowerRating").get<double>();
+    lineRmsCurrent = resolve_dimensional_values(j.at("lineRmsCurrent"));
+    switchingFrequency = j.at("switchingFrequency").get<double>();
+    riseTime = j.at("riseTime").get<double>();
+    deadtime = j.at("deadtime").get<double>();
+    pwmType = j.at("pwmType").get<std::string>();
+    modulationStrategy = j.at("modulationStrategy").get<std::string>();
+    thirdHarmonicInjectionCoefficient = j.value("thirdHarmonicInjectionCoefficient", 0.0);
+    modulationDepth = j.at("modulationDepth").get<double>();
+
+    for (const auto& opj : j.at("operatingPoints")) {
+        OperatingPoint op;
+        op.fundamentalFrequency = opj.at("fundamentalFrequency").get<double>();
+        if (opj.contains("powerFactor")) op.powerFactor = opj.at("powerFactor").get<double>();
+        if (opj.contains("currentPhaseAngle")) op.currentPhaseAngle = opj.at("currentPhaseAngle").get<double>();
+        if (opj.contains("outputPower")) op.outputPower = opj.at("outputPower").get<double>();
+        auto loadj = opj.at("load");
+        op.load.type = loadj.at("type").get<std::string>();
+        if (op.load.type == "grid") {
+            op.load.phaseVoltage = resolve_dimensional_values(loadj.at("phaseVoltage"));
+            op.load.gridFrequency = loadj.at("gridFrequency").get<double>();
+            op.load.gridResistance = resolve_dimensional_values(loadj.at("gridResistance"));
+            op.load.gridInductance = resolve_dimensional_values(loadj.at("gridInductance"));
+        } else {
+            op.load.resistance = resolve_dimensional_values(loadj.at("resistance"));
+            op.load.inductance = resolve_dimensional_values(loadj.at("inductance"));
+        }
+        operatingPoints.push_back(op);
+    }
+}
+
+// Simulate the inverter leg to estimate the RMS current ripple of the first
+// filter inductor.  The method reproduces the behaviour of the Python model:
+// it builds PWM waveforms, applies dead-time and diode clamping, computes the
+// pole-voltage spectrum and finally converts it to current via the network
+// impedance.
+double TwoLevelInverter::compute_current_ripple(const L1Params& l1,
+                                                size_t opIndex,
+                                                int fund_cycles,
+                                                int samples_per_carrier,
+                                                double f_cut) const {
+    const auto& op = operatingPoints.at(opIndex);
+    GridParams grid{op.load.phaseVoltage * std::sqrt(3.0), op.load.gridFrequency,
+                    op.load.gridResistance, op.load.gridInductance};
+
+    double PF;
+    bool lagging = true;
+    if (op.powerFactor.has_value()) {
+        PF = op.powerFactor.value();
+    } else if (op.currentPhaseAngle.has_value()) {
+        double ang = op.currentPhaseAngle.value() * M_PI / 180.0;
+        PF = std::cos(ang);
+        lagging = ang < 0;
+    } else {
+        PF = 1.0;
+    }
+    double P_leg = op.outputPower.value_or(inverterLegPowerRating);
+    auto ref = compute_leg_reference(P_leg, PF, lagging, grid, l1);
+
+    // Build time axis with the requested resolution
+    double f1 = op.fundamentalFrequency;
+    double f_carrier = switchingFrequency;
+    double fsamp = f_carrier * samples_per_carrier;
+    double T = static_cast<double>(fund_cycles) / f1;
+    size_t N = static_cast<size_t>(std::round(T * fsamp));
+    T = N / fsamp;
+    std::vector<double> t(N);
+    for (size_t i = 0; i < N; ++i) t[i] = i / fsamp;
+
+    auto i_leg = fundamental_leg_current_wave(ref.I_leg_rms, ref.I_leg_angle_deg, f1, t);
+    auto tri = tri_wave(t, f_carrier);
+    std::vector<double> va, vb, vc;
+    three_phase_references(ref.V_inv_rms, f1, ref.V_inv_angle_deg, t,
+                           thirdHarmonicInjectionCoefficient, va, vb, vc);
+    if (modulationStrategy == "SVPWM") {
+        svpwm_zero_sequence(va, vb, vc);
+    }
+    std::vector<int> s_a = carrier_compare(va, tri); // ideal top gate
+    std::vector<int> g_top, g_bot; int Ndt;
+    apply_deadtime_to_complementary(s_a, deadtime, fsamp, g_top, g_bot, Ndt);
+    auto v_pole = pole_voltage_with_deadtime(g_top, g_bot, dcBusVoltage, i_leg);
+
+    // Convert pole voltage to current via spectral division
+    auto [freqs, Vrms] = rms_spectrum(v_pole, fsamp);
+    auto denom = denom_mag(freqs, l1, grid);
+    std::vector<double> Irms(freqs.size(), 0.0);
+    for (size_t i = 0; i < freqs.size(); ++i) {
+        if (denom[i] > 0) Irms[i] = Vrms[i] / denom[i];
+    }
+
+    // Accumulate high‑frequency components into an RMS ripple value
+    double sum = 0.0;
+    for (size_t i = 0; i < freqs.size(); ++i) {
+        if (freqs[i] >= f_cut) sum += Irms[i] * Irms[i];
+    }
+    return std::sqrt(sum);
+}
 
 } // namespace OpenMagnetics
